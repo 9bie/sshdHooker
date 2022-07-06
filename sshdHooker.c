@@ -26,6 +26,8 @@ int Inject_Shellcode(pid_t target_pid){
         }
         memcpy(&original_regs,&regs,sizeof(struct user_regs_struct));
         printf ("+ Injecting shell code at %p\n", (void*)regs.rip);
+        char libc_path[255];
+        get_libc_path(target_pid,libc_path);
         void* libc_moudle_base = NULL;
         libc_moudle_base = get_module_base(-1,"libc-");
         void * handle = dlopen(libc_path,RTLD_LAZY);
@@ -33,8 +35,7 @@ int Inject_Shellcode(pid_t target_pid){
         void * self_malloc_addr = dlsym(handle,"malloc");
         printf("+ self libc moudle base:%p\n",libc_moudle_base);
         malloc_addr = get_remote_addr( target_pid, "libc-", (void *)self_malloc_addr );
-        char libc_path[255];
-        get_libc_path(target_pid,libc_path);
+
 
         printf("+ remote libc path:%s\n",libc_path);
 
