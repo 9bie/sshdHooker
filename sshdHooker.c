@@ -33,9 +33,10 @@ int Inject_Shellcode(pid_t target_pid){
         void * handle = dlopen(libc_path,RTLD_LAZY);
         void * self_dlopen_mode_addr = dlsym(handle,"__libc_dlopen_mode");
         void * self_malloc_addr = dlsym(handle,"malloc");
+        void * self_mmap_addr = dlsym(handle,"mmap");
         printf("+ self libc moudle base:%p\n",libc_moudle_base);
         malloc_addr = get_remote_addr( target_pid, "libc-", (void *)self_malloc_addr );
-        mmap_addr = get_remote_addr( target_pid, "libc-", (void *)mmap );
+        mmap_addr = get_remote_addr( target_pid, "libc-", (void *)self_mmap_addr );
 
         printf("+ remote libc path:%s\n",libc_path);
 
@@ -44,7 +45,7 @@ int Inject_Shellcode(pid_t target_pid){
         dlopen_mode_addr = get_remote_addr( target_pid, "libc-", (void *)self_dlopen_mode_addr );
 
         printf("+ remote malloc addr:%p\n",malloc_addr);
-
+        printf("+ remote mmap addr:%p local:%p\n",mmap_addr,self_mmap_addr);
         printf("+ remote libc_dlopen_mode addr:%p\n",dlopen_mode_addr);
         long parameters[10];
         parameters[0] = 0;      // addr
@@ -73,6 +74,8 @@ int Inject_Shellcode(pid_t target_pid){
         printf("+ Writing EvilSo Path at:%p\n",remote_code_ptr);
         parameters[1] = 0x2;      // addr
         parameters[0] = remote_code_ptr; // size
+        ///////////////////////////////
+
         //if(ptrace_call( target_pid, (uint64_t)dlopen_mode_addr, parameters, 2,&regs,0 )==-1){
           //      printf("- Called dlopen_mode_addr Error\n" );
             //    return -1;
