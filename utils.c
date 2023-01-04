@@ -230,6 +230,14 @@ int ptrace_detach( pid_t pid )
 
         return 0;
 }
+
+
+void ptrace_look(pid_t pid)
+{
+    
+}
+
+
 void get_libc_path( pid_t pid, char* path )
 {
     FILE *fp;
@@ -319,7 +327,7 @@ void* get_remote_addr( pid_t target_pid, const char* module_name, void* local_ad
     local_handle = get_module_base( -1, module_name );
     remote_handle = get_module_base( target_pid, module_name );
 
-    printf( "[+] get_remote_addr: local[%x], remote[%x]\n", local_handle, remote_handle );
+    printf( "+ get_remote_addr: local[%x], remote[%x]\n", local_handle, remote_handle );
 
     return (void *)(local_addr-local_handle+remote_handle  );
 }

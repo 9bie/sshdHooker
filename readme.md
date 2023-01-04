@@ -9,7 +9,7 @@ gcc -shared inject_got.c -ldl -fPIC -o test2.so
 
 mv test2.so /tmp/hello.so
 
-gcc sshdHooker.c utils.c -no-pie -g -o inject -ldl -lpthread
+gcc sshdHooker.c utils.c shellcode.s -no-pie -g -o inject -ldl -lpthread
 
 sudo ./inject sshd_pid
 ```
