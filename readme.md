@@ -18,12 +18,13 @@ bash install.sh
 
 
 其他参数：
+```
     -e   修改so文件的路径，默认/tmp/hello.so
     -o   修改注入器的路径，默认/tmp/.i.
     -m   修改mode默认值为0，输出到文件，默认记录地址为/tmp/.password.txt ，如果值为1，则会改为命令行模式
     -p   修改payload，默认值为/tmp/.password.txt，如果mode值为1，则会使用snsprintf来格式化命令并且输出，请确保字符串中包含两个%s，用于格式化用户名和密码
     -d   自动删除，设置为anyone则抓到密码后立刻删除，否则则抓取到设置的指定用户名后删除
-
+```
 ## 例子
 
 https发送密码
