@@ -10,7 +10,7 @@ sshd_pid=$(ps -ef | grep "sshd"|grep "listener" |grep -v grep | awk '{print $2}'
 slient_mode="0"
 slient_user="anyone"
 libc_string="libc-"
-if [! $sshd_pid ]; then 
+if [ ! $sshd_pid ]; then 
     echo "By default, high-precision pid detection fails and low-precision mode is used. The sshd process id may be inaccurate and may need to be specified using s."
     sshd_pid=$(ps -ef | grep "sshd" -m 1| grep -v grep | awk '{print $2}')
 fi
